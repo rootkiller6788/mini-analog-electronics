@@ -1,0 +1,174 @@
+﻿#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <assert.h>
+#include "diode_physics.h"
+#include "rectifier_topology.h"
+#include "filter_capacitor.h"
+#include "zener_regulator.h"
+#include "power_rectifier.h"
+#include "snubber_protection.h"
+
+static int tp = 0, tf = 0;
+#define CHK(c,m) do{if(!(c)){printf("FAIL: %s\n",m);tf++;}else{tp++;}}while(0)
+#define CLS(a,b) (fabs((a)-(b)) < 1e-9)
+
+int main(void) {
+  printf("=== mini-diode-rectifier Test Suite ===\n");
+  double vt = diode_thermal_voltage(300.0);
+  CHK(fabs(vt - 0.02585) < 1e-5, "V_T at 300K");
+  CHK(diode_thermal_voltage(0.0) == 0.0, "V_T at 0K");
+  double id = diode_shockley_current(0.0, 1e-12, 1.0, 0.02585);
+  CHK(CLS(id, 0.0), "I_D=0 at V_D=0");
+  id = diode_shockley_current(0.6, 1e-12, 1.0, 0.02585);
+  CHK(id > 1e-3 && id < 1.0, "I_D forward");
+  id = diode_shockley_current(-1.0, 1e-12, 1.0, 0.02585);
+  CHK(fabs(id + 1e-12) < 1e-14, "I_D reverse");
+  double vd_test = diode_shockley_voltage(0.001, 1e-12, 1.0, 0.02585);
+  CHK(vd_test > 0.5 && vd_test < 0.7, "V_D for 1mA forward");
+  double cj = diode_junction_capacitance(0.0, 100e-12, 0.75, 0.5);
+  CHK(CLS(cj, 100e-12), "C_j zero bias");
+  cj = diode_junction_capacitance(-5.0, 100e-12, 0.75, 0.5);
+  CHK(cj < 100e-12, "C_j reverse");
+  double cd = diode_diffusion_capacitance(0.01, 10e-9, 1.0, 0.02585);
+  CHK(cd > 1e-12, "C_diff forward");
+  CHK(diode_diffusion_capacitance(0.0, 10e-9, 1.0, 0.02585) == 0.0, "C_diff zero");
+  DiodeModelParams dp = {1e-12,1.0,0.5,100e-12,0.75,0.5,10e-9,100.0,1e-3,2.0,1.12,3.0,1.0,300.0,100.0};
+  DiodeSmallSignal ss;
+  diode_small_signal_model(&dp, 0.01, 0.65, 0.02585, &ss);
+  CHK(ss.r_d > 1.0 && ss.r_d < 10.0, "r_d reasonable");
+  CHK(ss.c_d > ss.C_j, "c_d > C_j");
+  double is350 = diode_I_S_at_temperature(&dp, 350.0);
+  CHK(is350 > dp.I_S, "I_S increases with T");
+  DiodeTempSweep sw;
+  diode_temperature_sweep(&dp, 300.0, &sw);
+  CHK(sw.V_F_tc < 0.0, "V_F TC negative");
+  CHK(diode_classify_region(0.7,0.01,100.0,300.0,400.0) == DIODE_REGION_FORWARD_BIAS, "forward region");
+  CHK(diode_classify_region(-5.0,-1e-12,100.0,300.0,400.0) == DIODE_REGION_REVERSE_BIAS, "reverse region");
+  CHK(diode_classify_region(-150.0,-1.0,100.0,300.0,400.0) == DIODE_REGION_BREAKDOWN, "breakdown");
+  CHK(diode_classify_region(0.7,0.01,100.0,500.0,400.0) == DIODE_REGION_THERMAL_RUNAWAY, "thermal runaway");
+  double vbi = diode_built_in_potential(1e18, 1e16, 1e10, 0.02585);
+  CHK(vbi > 0.5 && vbi < 1.0, "V_bi for Si");
+  double W = diode_depletion_width(0.0, 0.72, 1e18, 1e16, 1.04e-12);
+  CHK(W > 1e-5 && W < 1e-3, "depletion width");
+  double BV = diode_breakdown_voltage_estimate(1e15, 3e5, 1.04e-12);
+  CHK(BV > 50.0 && BV < 1000.0, "BV estimate");
+  CHK(diode_material_lookup("Si") != NULL, "Si found");
+  CHK(diode_material_lookup("GaN") != NULL, "GaN found");
+  CHK(diode_material_lookup("SiC") != NULL, "SiC found");
+  DiodeOpPoint op;
+  int iter = diode_load_line_solve(&dp, 5.0, 1000.0, 0.02585, 100, 1e-9, &op);
+  CHK(iter > 0, "load line converged");
+  CHK(op.V_D > 0.0 && op.V_D < 5.0, "op V_D valid");
+  double I_D_out, P_D_out;
+  iter = diode_full_iv(&dp, 0.7, 0.02585, 100, 1e-9, &I_D_out, &P_D_out);
+  CHK(iter > 0 && I_D_out > 1e-3, "full IV forward");
+  RectifierConfig rcfg = {RECTIFIER_BRIDGE, 12.0, 12.0*1.4142, 60.0, 100.0, 0.7, 1.0};
+  HalfWaveResult hw = rectifier_half_wave_analyze(&rcfg);
+  CHK(hw.V_dc > 0.0, "HW V_dc > 0");
+  CHK(hw.ripple_factor > 1.0, "HW ripple > 1");
+  CHK(hw.efficiency > 0.3 && hw.efficiency < 0.5, "HW eff");
+  BridgeResult br = rectifier_bridge_analyze(&rcfg);
+  CHK(br.V_dc > hw.V_dc, "Bridge V_dc > HW");
+  CHK(br.ripple_factor < hw.ripple_factor, "Bridge ripple < HW");
+  CHK(CLS(rectifier_ripple_frequency(RECTIFIER_BRIDGE, 60.0), 120.0), "Bridge f_ripple");
+  CHK(CLS(rectifier_calculate_piv(RECTIFIER_FULL_WAVE_CT, 170.0, 0.7), 340.0), "FWCT PIV");
+  VoltageMultiplierConfig vm = {3, 170.0, 60.0, 10e-6, 0.001, 0.7};
+  VoltageMultiplierResult vmr = rectifier_voltage_multiplier_analyze(&vm);
+  CHK(vmr.V_out_no_load > 900.0, "VM no-load");
+  CHK(vmr.V_out_load < vmr.V_out_no_load, "VM loaded");
+  CapacitorFilterParams cfp = {1000e-6, 100.0, 17.0, 120.0, 0.1, 0.7};
+  RippleAnalysis ra = filter_capacitor_ripple_analyze(&cfp);
+  CHK(ra.V_r_pp > 0.0 && ra.V_r_pp < cfp.V_m, "ripple valid");
+  CHK(ra.V_dc_avg > 0.0 && ra.V_dc_avg < cfp.V_m, "V_dc_avg valid");
+  double cmin = filter_minimum_capacitance(0.1, 120.0, 1.0);
+  CHK(cmin > 100e-6, "C_min reasonable");
+  CHK(filter_rc_discharge(10.0, 0.00833, 100.0, 1000e-6) < 10.0, "RC discharge");
+  LCFilterParams lcp = {0.01, 1000e-6, 100.0, 17.0, 120.0, 0.0};
+  LCFilterResult lcr = filter_lc_choke_analyze(&lcp);
+  CHK(lcr.L_critical_actual > 0.0, "critical L");
+  PiFilterParams pip = {1000e-6, 0.001, 470e-6, 100.0, 120.0};
+  PiFilterResult pir = filter_pi_analyze(&pip);
+  CHK(pir.attenuation_total_db > 0.0, "Pi attenuation");
+  FilterDesignTarget fdt = {17.0, 12.0, 0.5, 0.5, 120.0, 5.0, FILTER_NONE};
+  FilterDesignResult fdr = filter_design_auto(&fdt);
+  CHK(fdr.C > 0.0, "auto design");
+  ZenerParams zp = {5.1, 0.020, 7.0, 0.001, 0.100, 1.0, 0.001, 423.0, 100.0};
+  ZenerRegulatorDesign zd = {9.0, 12.0, 5.0, 0.0, 0.050, 1.0};
+  ZenerRegulatorResult zr;
+  zener_regulator_design(&zp, &zd, &zr);
+  CHK(zr.is_feasible, "zener feasible");
+  CHK(zr.R_S > 0.0 && zr.R_S < 1000.0, "R_S reasonable");
+  double vout = zener_output_voltage(10.0, zr.R_S, 0.025, &zp);
+  CHK(vout > 4.5 && vout < 5.5, "V_out near 5V");
+  CHK(zener_check_knee(&zp, zr.I_Z_min), "knee check");
+  CHK(zener_check_power(&zp, zr.P_Z_max, 300.0), "power check");
+  ThreePhaseConfig tpc = {480.0, 60.0, 50.0, 0.001, 1.0, THREEPHASE_WYE, 0};
+  ThreePhaseResult tpr = power_three_phase_analyze(&tpc);
+  CHK(tpr.V_dc > 500.0, "3ph V_dc");
+  CHK(CLS(tpr.ripple_freq_Hz, 360.0), "6-pulse 360Hz");
+  ThermalConfig tc = {313.0, 423.0, 1.5, 0.5, 10.0, 5.0};
+  ThermalResult tr = power_thermal_analyze(&tc);
+  CHK(tr.Tj > tc.Ta, "Tj > Ta");
+  PowerLossBreakdown pl = power_loss_breakdown(1.0, 8.0, 2, 60.0, 400.0, 0.5, 100e-9);
+  CHK(pl.P_total > 0.0, "loss > 0");
+  InrushAnalysis inr = power_inrush_analyze(170.0, 1000e-6, 0.5, 0.0, 10.0);
+  CHK(inr.I_peak_inrush > 10.0, "inrush");
+  double eff_s = power_synchronous_rectifier_efficiency(10.0, 0.010, 0.7, 12.0);
+  CHK(eff_s > 0.9, "sync rect eff");
+  RCSnubberConfig rcc = {400.0, 10.0, 100e-9, 100e-12, 100e3, 1e12, 0.2};
+  RCSnubberResult rcr = snubber_rc_design(&rcc);
+  CHK(rcr.C_s > 0.0 && rcr.R_s > 0.0, "RC snubber components valid");
+  CHK(rcr.C_s > 0.0 && rcr.R_s > 0.0, "snubber comp");
+  ReverseRecoveryParams rrp = {100e-9, 500e-9, 10.0, 0.5, 10.0, 100e6, 400.0, 350.0};
+  ReverseRecoveryResult rrr = snubber_reverse_recovery_analyze(&rrp);
+  CHK(rrr.E_rr_per_switch > 0.0, "E_rr > 0");
+  SnubberDesignInput sdi = {400.0, 10.0, 50e-9, 100e3, 80.0, rrp};
+  SnubberDesignOutput sdo = snubber_design_complete(&sdi);
+  CHK(sdo.P_total_snubber > 0.0, "snubber loss");
+  double Rcl, Ccl, Pcl;
+  snubber_rcd_clamp_design(400.0, 5e-6, 10.0, 100e3, 500.0, &Rcl, &Ccl, &Pcl);
+  CHK(Rcl > 0.0, "RCD clamp");
+  double Rp, Cp, Pp;
+  snubber_transformer_damper(10e-6, 500e-12, 0.0, 50.0, &Rp, &Cp, &Pp);
+  CHK(Rp > 0.0, "damper");
+  TVSParams tvs;
+  snubber_tvs_select(24.0, 40.0, 50.0, 1000e-6, &tvs);
+  CHK(tvs.V_RWM >= 24.0, "TVS");
+  double best_wbg = snubber_wide_bandgap_benefit(400.0, 10.0, 100e3, 500e-9, 1.0, 0.010, 1.5);
+  CHK(best_wbg > 0.9, "WBG");
+  double L_est = snubber_estimate_loop_inductance(10.0, 2.0, 1.6, 2);
+  CHK(L_est > 1e-9 && L_est < 1e-6, "loop L");
+  ZenerParams ztc = {6.2, 0.020, 10.0, 0.001, 0.050, 0.5, 0.002, 423.0, 200.0};
+  ZenerTempCompensation comp;
+  zener_temp_compensated_design(&ztc, 300.0, &comp);
+  CHK(comp.V_ref_total > comp.V_Z_alone, "TC compensation ref > Zener alone");
+  double e1, e3;
+  power_efficiency_compare(48.0, 10.0, &e1, &e3);
+  CHK(e3 > e1, "3ph eff > 1ph");
+  MultiPulseConfig mpc = {12, 480.0, 60.0, 50.0, 1.0};
+  MultiPulseResult mpr = power_multipulse_analyze(&mpc);
+  CHK(mpr.THD_input_current < 20.0, "12-pulse THD");
+  double harms[5];
+  power_line_harmonics(1.0, 0.5, 5, harms);
+  CHK(harms[0] > 0.0, "fundamental");
+  CHK(CLS(harms[1], 0.0), "2nd harmonic=0");
+  CHK(filter_recommend(0.1, 0.01, 0, 1) == FILTER_CAPACITOR_INPUT, "filter recommend");
+  CHK(filter_output_impedance(FILTER_CAPACITOR_INPUT, 1000e-6, 0.0, 0.1, 120.0) > 0.0, "Z_out");
+  CHK(filter_load_step_response(1000e-6, 1.0, 10e-6) < 0.1, "load step");
+  CHK(rectifier_select_topology(120.0, 1.0, 0, 1) == RECTIFIER_BRIDGE, "topology select");
+  SCRRectifierConfig sc = {RECTIFIER_SCR_CONTROLLED, 120.0, 60.0, 50.0, 0.0, 0.7};
+  SCRRectifierResult sr = rectifier_scr_analyze(&sc);
+  CHK(sr.V_dc > 0.0, "SCR V_dc");
+  CHK(zener_breakdown_type(5.1) == 0, "5.1V mixed breakdown");
+  CHK(zener_breakdown_type(10.0) == 1, "10V avalanche");
+  CHK(zener_breakdown_type(3.3) == -1, "3.3V Zener tunneling");
+  double zz = zener_dynamic_impedance(&zp, 0.020);
+  CHK(CLS(zz, 7.0), "Z_Z at test I");
+  double vob, iob, lrb;
+  zener_series_pass_boost(&zr, 100.0, 0.7, &vob, &iob, &lrb);
+  CHK(vob > 3.0, "boost V_out");
+  CHK(iob > zr.I_Z_max, "boost I_out");
+  printf("\nRESULTS: %d passed, %d failed\n", tp, tf);
+  return tf > 0 ? 1 : 0;
+}
